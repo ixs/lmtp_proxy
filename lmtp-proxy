@@ -1,0 +1,178 @@
+#!/bin/env python
+#
+# A simple LMTP delivery proxy
+#
+# 2017 Andreas Thienemann <andreas@bawue.net>
+# Licensed under GPLv3+
+# https://github.com/ixs/lmtp_proxy
+#
+
+import argparse
+import asyncore
+import grp
+from lmtpd import LMTPServer
+import os
+import pwd
+import signal
+import smtplib
+import syslog
+import sys
+import yaml
+
+class LMTPProxy(LMTPServer):
+  def __init__(self, address, owner=-1, group=-1, permissions=None):
+
+    self.config = None
+    self.options = {}
+
+    # In case we get a unix socket, we need to remove the file first
+    if address[0] == '/':
+      try:
+        os.unlink(address)
+      except OSError:
+        if os.path.exists(address):
+          raise
+      address_text = address
+    else:
+      address = tuple(address)
+      address_text = '{}:{}'.format(*address)
+
+    LMTPServer.__init__(self, address)
+
+    # Make sure the file has the necessary permissions
+    if address[0] == '/':
+      if owner is not None:
+        os.chown(address, pwd.getpwnam(owner).pw_uid, -1)
+      if group is not None:
+        os.chown(address, -1, grp.getgrnam(owner).gr_gid)
+      if permissions is not None:
+        os.chmod(address, permissions)
+
+    self.log('Listening for incoming connection on {}'.format(address_text))
+
+  def log(self, message):
+    if not self.options.get('daemonize', False):
+      print(message)
+    syslog.syslog(syslog.LOG_INFO, message)
+
+  def lookup_user_backend(self, user):
+    backend = self.config['users'].get(user, self.config['config'].get('fallback_backend', None))
+    if backend is None:
+      raise RuntimeError('No fallback backend configured')
+    return backend
+
+  def lmtp_deliver(self, backend, mailfrom, rcptto, data):
+    if backend == 'reject':
+      self.log('LMTP message from <{}> to <{}> temporarily rejected'.format(mailfrom, rcptto))
+      return '450 LMTP user {} rejected. Please try again.'.format(rcptto)
+
+    backend_data = self.config['backends'].get(backend, None)
+    if backend_data is None:
+      self.log('No backend configuration found for backend {}'.format(backend))
+      return '451 No backend configuration found for backend {}'.format(backend)
+
+    if 'socket' in backend_data:
+      server = smtplib.LMTP(backend_data['socket'])
+      address_text = backend_data['socket']
+    else:
+      server = smtplib.LMTP(backend_data['host'], backend_data['port'])
+      address_text = '{}:{}'.format(backend_data['host'], backend_data['port'])
+
+    if 'user' in backend_data and 'password' in backend_data:
+      server.login(backend_data['user'], backend_data['password'])
+
+    try:
+      server.sendmail(mailfrom, rcptto, data)
+      server.quit()
+      self.log('LMTP message from <{}> to <{}> delivered to {} ({})'.format(mailfrom, rcptto, backend, address_text))
+      return None
+    except smtplib.SMTPRecipientsRefused as e:
+      server.quit()
+      code = dict(e[0]).values()[0][0]
+      msg = (dict(e[0]).values()[0][1]).split("\n")
+      output = []
+      i = 0
+      for line in msg:
+        if (i + 1) == len(msg):
+          sep = " "
+        else:
+          sep = "-"
+        output.append("{}{}{}".format(code, sep, line))
+        i += 1
+      self.log('LMTP message from <{}> to <{}> not delivered to {} ({}). {}'.format(mailfrom, rcptto, backend, address_text, "\n".join(output)))
+      return "\r\n".join(output)
+    except:
+      server.quit()
+      error = " ".join(map(str, sys.exc_info()[1]))
+      self.log('LMTP message from <{}> to <{}> not delivered to {} ({}): {}'.format(mailfrom, rcptto, backend, address_text, error))
+      return error
+
+  def process_message(self, peer, mailfrom, rcptto, data):
+    if self.config['config'].get('ignoreDomain', False):
+      user = rcptto.split('@')[0]
+    else:
+      user = rcptto
+
+    backend = self.lookup_user_backend(user)
+
+    self.log('Incoming message from <{}> to <{}>, forwarding to {} backend'.format(mailfrom, rcptto, backend))
+    return self.lmtp_deliver(backend, mailfrom, rcptto, data)
+
+  def reload_user_list(self, signum, frame):
+    try:
+      with open(self.options['config']) as f:
+        self.config = yaml.safe_load(f)
+      self.log('Userlist reloaded. {} Entries found'.format(len(self.config.get('users', {}))))
+    except:
+      pass
+
+def parse_cmdline():
+  parser = argparse.ArgumentParser(
+    description="""An LMTP Proxy server. Accepts mail via LMTP on an incoming
+      socket and can forward to different lmtp sockets depending on the
+      destination address.""")
+  parser.add_argument('-c', '--config', help="Configuration file location", nargs="?", default="/etc/lmtp-proxy.conf")
+  parser.add_argument('-D', '--daemonize', help="Deamonize program. If unspecified, run in foreground", action="store_true", default=False)
+  return parser.parse_args()
+
+def parse_config(file):
+  with open(file) as f:
+    config = yaml.safe_load(f)
+  return config
+
+def main():
+  options = parse_cmdline()
+  config = parse_config(options.config)
+  tmp = {'daemonize': options.daemonize, 'config': options.config }
+
+  syslog.openlog(ident="lmtp-proxy", logoption=syslog.LOG_PID, facility=syslog.LOG_MAIL)
+  syslog.syslog(syslog.LOG_INFO, 'Started using configuration file {}'.format(options.config))
+
+  address = config['config'].get('socket', False)
+  owner = config['config'].get('owner', None)
+  group = config['config'].get('group', None)
+  permissions = config['config'].get('permissions', None)
+  pid = config['config'].get('pid', '/var/run/lmtp-proxy.pid')
+
+  server = LMTPProxy(address, owner, group, permissions)
+  server.config = config
+  server.options = tmp
+
+  signal.signal(signal.SIGUSR1, server.reload_user_list)
+
+  try:
+    asyncore.loop()
+  except KeyboardInterrupt:
+    asyncore.ExitNow()
+
+if __name__ == "__main__":
+  options = parse_cmdline()
+
+  config = parse_config(options.config)
+  pid = config['config'].get('pid', '/var/run/lmtp-proxy.pid')
+
+  if options.daemonize:
+    from daemonize import Daemonize
+    daemon = Daemonize(app="lmtp-proxy", pid=pid, action=main)
+    daemon.start()
+  main()
