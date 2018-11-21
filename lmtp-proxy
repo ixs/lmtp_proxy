@@ -132,7 +132,7 @@ def parse_cmdline():
       socket and can forward to different lmtp sockets depending on the
       destination address.""")
   parser.add_argument('-c', '--config', help="Configuration file location", nargs="?", default="/etc/lmtp-proxy.conf")
-  parser.add_argument('-D', '--daemonize', help="Deamonize program. If unspecified, run in foreground", action="store_true", default=False)
+  parser.add_argument('-D', '--daemonize', help="Daemonize program. If unspecified, run in foreground", action="store_true", default=False)
   return parser.parse_args()
 
 def parse_config(file):
