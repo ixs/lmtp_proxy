@@ -108,10 +108,12 @@ class LMTPProxy(LMTPServer):
       return error
 
   def process_message(self, peer, mailfrom, rcptto, data):
+    local_part_suffix = self.config['config'].get('localPartSuffix', False)
+    user = rcptto
+    if local_part_suffix:
+      user = '{}@{}'.format(user.split(local_part_suffix)[0], user.split('@')[1])
     if self.config['config'].get('ignoreDomain', False):
-      user = rcptto.split('@')[0]
-    else:
-      user = rcptto
+      user = user.split('@')[0]
 
     backend = self.lookup_user_backend(user)
 
